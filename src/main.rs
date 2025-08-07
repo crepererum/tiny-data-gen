@@ -2,7 +2,6 @@ use std::{
     fmt::Write,
     num::NonZeroUsize,
     time::{Duration, SystemTime, UNIX_EPOCH},
-    usize,
 };
 
 use anyhow::{Context, Error, Result};
@@ -164,9 +163,9 @@ where
         .expect("time should go forward")
         .as_nanos();
 
-    write!(
+    writeln!(
         w,
-        "table,tag={tag} field_s=\"{field_s}\",field_i={field_i}i,field_u={field_u}u,field_f={field_f},field_b={field_b} {time}\n"
+        "table,tag={tag} field_s=\"{field_s}\",field_i={field_i}i,field_u={field_u}u,field_f={field_f},field_b={field_b} {time}"
     )
     .context("write")
 }
