@@ -1,12 +1,13 @@
 use std::{
     fmt::Write,
     num::NonZeroUsize,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
     usize,
 };
 
 use anyhow::{Context, Error, Result};
 use async_compression::tokio::write::GzipEncoder;
+use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use futures_concurrency::{prelude::ConcurrentStream, stream::StreamExt};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
@@ -87,12 +88,14 @@ async fn main() -> Result<()> {
                 }
             };
 
+            let body = Bytes::from(body);
+
             Result::<_, Error>::Ok((i, content_encoding, body))
         })
         .try_for_each(async |res| {
             let (i, content_encoding, body) = res?;
 
-            client
+            let request = client
                 .post(format!("{}/api/v2/write", args.url.trim_end_matches("/")))
                 .query(&[
                     ("org", args.org.as_str()),
@@ -104,11 +107,31 @@ async fn main() -> Result<()> {
                 .header(CONTENT_ENCODING, content_encoding)
                 .header(CONTENT_TYPE, "text/plain; charset=utf-8")
                 .body(body)
-                .send()
-                .await
-                .context("post data")?
-                .error_for_status()
-                .context("error status")?;
+                .build()
+                .context("build request")?;
+
+            // retry server errors
+            loop {
+                let request = request.try_clone().expect("can clone request");
+                let resp = client.execute(request).await.context("post data")?;
+
+                match resp.error_for_status() {
+                    Ok(_) => break,
+                    Err(err)
+                        if err
+                            .status()
+                            .map(|s| s.is_server_error())
+                            .unwrap_or_default() =>
+                    {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err).context("status error");
+                    }
+                }
+            }
+
             println!("sent {}", i + 1);
             Result::<(), Error>::Ok(())
         })

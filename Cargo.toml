@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.98"
 async-compression = { version = "0.4.27", features = ["gzip", "tokio"] }
+bytes = "1.10.1"
 clap = { version = "4.5.41", features = ["derive"] }
 futures = "0.3.31"
 futures-concurrency = "7.6.3"
