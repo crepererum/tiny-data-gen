@@ -1524,6 +1524,9 @@ dependencies = [
  "rand",
  "reqwest",
  "tokio",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
 ]
 
 [[package]]

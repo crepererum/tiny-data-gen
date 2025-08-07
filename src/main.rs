@@ -1,18 +1,24 @@
-use std::{
-    fmt::Write,
-    num::NonZeroUsize,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{num::NonZeroUsize, sync::Arc};
 
 use anyhow::{Context, Error, Result};
 use async_compression::tokio::write::GzipEncoder;
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
+use data::{DataCLIConfig, generate_batch};
 use futures_concurrency::{prelude::ConcurrentStream, stream::StreamExt};
-use http::header::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
-use rand::{Rng, RngCore, distr::Alphabetic};
+use http::{
+    StatusCode,
+    header::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
+};
+use logging::{LoggingCLIConfig, setup_logging};
 use reqwest::Client;
+use retry::retry;
 use tokio::io::AsyncWriteExt;
+use tracing::info;
+
+mod data;
+mod logging;
+mod retry;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -32,10 +38,6 @@ struct Args {
     #[clap(long)]
     token: String,
 
-    /// Number of lines per submission batch.
-    #[clap(long, default_value_t = 10_000)]
-    batch_lines: usize,
-
     /// Number of batches.
     ///
     /// Defaults to "infinite".
@@ -49,28 +51,30 @@ struct Args {
     /// GZip compression level of HTTP data.
     #[clap(long)]
     compression_level: Option<CompressionLevel>,
+
+    /// Data gen args.
+    #[clap(flatten)]
+    data_cfg: DataCLIConfig,
+
+    /// Logging args.
+    #[clap(flatten)]
+    logging_cfg: LoggingCLIConfig,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    setup_logging(args.logging_cfg).context("set up logging")?;
+
     let client = Client::builder().build().context("build client")?;
+
+    let data_cfg = Arc::new(args.data_cfg);
 
     futures::stream::iter(0..args.batches.unwrap_or(usize::MAX))
         .co()
         .limit(Some(args.concurrency_limit))
         .map(async |i| {
-            let batch_lines = args.batch_lines;
-            let lines = tokio::task::spawn_blocking(move || {
-                let mut rng = rand::rng();
-                let mut lines = String::new();
-                for _ in 0..batch_lines {
-                    gen_line(&mut lines, &mut rng).context("gen line")?;
-                }
-                Result::<_, Error>::Ok(lines)
-            })
-            .await
-            .context("join")??;
+            let lines = generate_batch(&data_cfg).await.context("generate batch")?;
 
             let (content_encoding, body) = match args.compression_level {
                 None => ("identity", lines.into_bytes()),
@@ -109,65 +113,29 @@ async fn main() -> Result<()> {
                 .build()
                 .context("build request")?;
 
-            // retry server errors
-            loop {
-                let request = request.try_clone().expect("can clone request");
-                let resp = client.execute(request).await.context("post data")?;
+            retry(
+                "send request",
+                async || {
+                    let request = request.try_clone().expect("can clone request");
+                    let resp = client.execute(request).await?;
+                    resp.error_for_status()?;
+                    Ok(())
+                },
+                |err: &reqwest::Error| {
+                    err.status()
+                        .map(|s| s.is_server_error() || s == StatusCode::TOO_MANY_REQUESTS)
+                        .unwrap_or_default()
+                },
+            )
+            .await
+            .context("retry request")?;
 
-                match resp.error_for_status() {
-                    Ok(_) => break,
-                    Err(err)
-                        if err
-                            .status()
-                            .map(|s| s.is_server_error())
-                            .unwrap_or_default() =>
-                    {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    Err(err) => {
-                        return Err(err).context("status error");
-                    }
-                }
-            }
-
-            println!("sent {}", i + 1);
+            info!(batch = i + 1, "sent batch");
             Result::<(), Error>::Ok(())
         })
         .await?;
 
     Ok(())
-}
-
-fn gen_line<W, R>(w: &mut W, rng: &mut R) -> Result<()>
-where
-    W: Write,
-    R: RngCore,
-{
-    let tag: String = rng
-        .sample_iter(Alphabetic)
-        .take(1)
-        .map(char::from)
-        .collect();
-    let field_s: String = rng
-        .sample_iter(Alphabetic)
-        .take(8)
-        .map(char::from)
-        .collect();
-    let field_i: i64 = rng.random();
-    let field_u: u64 = rng.random();
-    let field_f: f64 = rng.random();
-    let field_b: bool = rng.random();
-    let time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should go forward")
-        .as_nanos();
-
-    writeln!(
-        w,
-        "table,tag={tag} field_s=\"{field_s}\",field_i={field_i}i,field_u={field_u}u,field_f={field_f},field_b={field_b} {time}"
-    )
-    .context("write")
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
